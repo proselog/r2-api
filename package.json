@@ -8,8 +8,11 @@
   },
   "private": true,
   "scripts": {
-    "dev": "wrangler dev",
+    "dev": "wrangler dev --env development",
     "deploy": "wrangler publish"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@proselog/jwt": "^0.1.1"
+  }
 }

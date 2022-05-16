@@ -1,3 +1,5 @@
+import { decrypt, getDerivedKey } from "@proselog/jwt"
+
 const randomId = () => crypto.randomUUID()
 
 const getExtension = (path: string) => {
@@ -5,70 +7,119 @@ const getExtension = (path: string) => {
   return lastPart ? `.${lastPart}` : ""
 }
 
-const json = (data: any) =>
-  new Response(JSON.stringify(data), {
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Allow-Methods": "*",
+}
+
+const send = (data: string | Record<string, string>, init?: ResponseInit) => {
+  const isJSON = data && typeof data === "object"
+  return new Response(isJSON ? JSON.stringify(data) : data, {
+    ...init,
     headers: {
-      "content-type": "application/json",
+      ...init?.headers,
+      ...corsHeaders,
+      "content-type": isJSON ? "application/json" : "text/plain",
     },
   })
+}
 
-const handler: ExportedHandler<{ BUCKET: R2Bucket; API_TOKEN: string }> = {
-  async fetch(request, env): Promise<Response> {
+const handler: ExportedHandler<{ BUCKET: R2Bucket; ENCRYPT_SECRET: string }> = {
+  async fetch(request, env, event): Promise<Response> {
     try {
       // Files are publicly accessible
       if (request.method === "GET") {
+        const cache = caches.default
+
         const url = new URL(request.url)
 
         if (url.pathname === "/") {
-          return new Response("hello world")
+          return send("hello world")
         }
 
         const key = url.pathname.substring(1)
+
+        const cachedResponse = await cache.match(request)
+
+        if (cachedResponse) {
+          console.log("cached!")
+          return cachedResponse
+        }
+
         const object = await env.BUCKET.get(key)
         if (!object) {
-          return new Response("object not found", { status: 404 })
+          return send("object not found", { status: 404 })
         }
-        return new Response(object.body)
+        const response = new Response(object.body, {
+          headers: {
+            "Cache-Control": "public, max-age=31536000, immutable",
+          },
+        })
+        event.waitUntil(cache.put(request, response.clone()))
+        return response
+      }
+
+      if (request.method === "OPTIONS") {
+        return send("")
       }
 
       if (request.method === "POST") {
         const token = request.headers
           .get("authorization")
           ?.replace("Bearer ", "")
+          .trim()
 
-        if (token !== env.API_TOKEN) {
-          return new Response("invalid token", {
-            status: 401,
-          })
+        if (!token) {
+          throw new Error("missing auth token")
+        }
+
+        let prefix: string | undefined
+        if (env.ENCRYPT_SECRET && token) {
+          const key = await getDerivedKey(env.ENCRYPT_SECRET)
+          try {
+            const payload = await decrypt(token, key)
+            prefix = payload.prefix as string
+          } catch (error) {
+            console.error({ error })
+            return send("invalid token", {
+              status: 401,
+            })
+          }
+        }
+
+        if (prefix == null || typeof prefix !== "string") {
+          throw new Error("failed to extract prefix from token")
         }
 
         const data = await request.formData()
         const id = randomId()
-        const prefix = data.get("prefix")
         const file = data.get("file") as File
 
         if (!file || !(file instanceof File)) {
           throw new Error("missing file or invalid file")
         }
 
-        if (prefix && typeof prefix !== "string") {
-          throw new Error("prefix must be a string")
-        }
-
-        const key = `${prefix || ""}${id}${getExtension(file.name)}`
+        const key = `${prefix}${id}${getExtension(file.name)}`
 
         await env.BUCKET.put(key, await file.arrayBuffer(), {
           httpMetadata: {
             contentType: file.type,
           },
+          customMetadata: {
+            // Store the original filename
+            filename: file.name,
+          },
         })
-        return json({ key })
+
+        return send({ key })
       }
     } catch (error: any) {
-      return new Response(error.message, { status: 500 })
+      console.error({ error })
+      return send(error.message, { status: 500 })
     }
 
-    return new Response("Hello World!")
+    return send("Hello World!")
   },
 }
 
